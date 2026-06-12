@@ -107,13 +107,13 @@ Dự án AI Agent đã được "production-ready" hóa bằng cách áp dụng 
 
 *   **Project:** Production-ready AI Agent
 *   **API URL Link:** `https://ai-agent-lab-prod-production.up.railway.app`
-*   **API Key dùng để test:** `secret-agent-key` (Hoặc giá trị đã được thiết lập trên Railway)
+*   **API Key dùng để test:** `your-secret-agent-api-key-here` (Hoặc giá trị đã được thiết lập trên Railway)
 
 ### Hướng dẫn test API:
 
 Sử dụng PowerShell với lệnh `Invoke-RestMethod`:
 ```powershell
-Invoke-RestMethod -Uri "https://ai-agent-lab-prod-production.up.railway.app/ask" -Method POST -Headers @{ "X-API-Key" = "secret-agent-key"; "Content-Type" = "application/json" } -Body '{"question": "What is Docker?"}'
+Invoke-RestMethod -Uri "https://ai-agent-lab-prod-production.up.railway.app/ask" -Method POST -Headers @{ "X-API-Key" = "your-secret-agent-api-key-here"; "Content-Type" = "application/json" } -Body '{"question": "What is Docker?"}'
 ```
 
 **Kết quả mong đợi:**
