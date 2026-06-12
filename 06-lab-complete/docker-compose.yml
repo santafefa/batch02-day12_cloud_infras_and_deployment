@@ -1,33 +1,42 @@
-version: "3.9"
+version: '3.8'
 
 services:
   agent:
-    build: .
+    build:
+      context: . # Build from the current directory (06-lab-complete)
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
     environment:
-      - ENVIRONMENT=staging
-      - APP_NAME=Production AI Agent
-      - REDIS_URL=redis://redis:6379/0
-    env_file:
-      - .env.local
+      # Use environment variables from .env file
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - AGENT_API_KEY=${AGENT_API_KEY}
+      - REDIS_URL=redis://redis:6379/0 # Connect to the redis service
+      - ENVIRONMENT=development # Set to production for cloud deployment
+      - LOG_LEVEL=${LOG_LEVEL}
+      - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE}
+      - MONTHLY_BUDGET_USD=${MONTHLY_BUDGET_USD}
+      - CONVERSATION_HISTORY_LENGTH=${CONVERSATION_HISTORY_LENGTH}
+      - CONVERSATION_HISTORY_TTL_SECONDS=${CONVERSATION_HISTORY_TTL_SECONDS}
+      - DEBUG=${DEBUG}
     depends_on:
-      redis:
-        condition: service_healthy
+      - redis
     healthcheck:
-      test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 15s
-    restart: unless-stopped
+      start_period: 40s
+    # Optional: Mount code for local development (comment out for production build)
+    volumes: # Mount the entire project directory (06-lab-complete) to /app in the container
+      - .:/app
 
   redis:
     image: redis:7-alpine
-    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data # Persist Redis data
+
+volumes:
+  redis_data:

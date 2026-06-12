@@ -1,285 +1,286 @@
 """
-Production AI Agent — Kết hợp tất cả Day 12 concepts
+BASIC — Health Check + Graceful Shutdown
 
-Checklist:
-  ✅ Config từ environment (12-factor)
-  ✅ Structured JSON logging
-  ✅ API Key authentication
-  ✅ Rate limiting
-  ✅ Cost guard
-  ✅ Input validation (Pydantic)
-  ✅ Health check + Readiness probe
-  ✅ Graceful shutdown
-  ✅ Security headers
-  ✅ CORS
-  ✅ Error handling
+Hai tính năng tối thiểu cần có trước khi deploy:
+  1. GET /health  — liveness: "agent có còn sống không?"
+  2. GET /ready   — readiness: "agent có sẵn sàng nhận request chưa?"
+  3. Graceful shutdown: hoàn thành request hiện tại trước khi tắt
+
+Chạy:
+    python app.py
+
+Test health check:
+    curl http://localhost:8000/health
+    curl http://localhost:8000/ready
+
+Simulate shutdown:
+    # Trong terminal khác
+    kill -SIGTERM <pid>
+    # Xem agent log graceful shutdown message
 """
 import os
 import time
 import signal
+import json # Added import for json
 import logging
-import json
 from datetime import datetime, timezone
-from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Security, Depends, Request, Response
-from fastapi.security.api_key import APIKeyHeader
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+import psutil # Import psutil for memory check (for health check)
+import redis
+
+from fastapi import FastAPI, HTTPException, Request, Depends
+from pydantic import BaseModel
 import uvicorn
+# Import custom modules
+from .config import settings
+from .auth import verify_api_key
+from .rate_limiter import check_rate_limit
+from .cost_guard import check_budget
+# Import mock LLM (now self-contained in app/)
+from .mock_llm import ask
 
-from app.config import settings
+# Configure structured JSON logging
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_entry = {
+            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "module": record.module,
+            "funcName": record.funcName,
+            "lineno": record.lineno,
+        }
+        if hasattr(record, 'extra_data'):
+            log_entry.update(record.extra_data)
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_entry)
 
-# Mock LLM (thay bằng OpenAI/Anthropic khi có API key)
-from utils.mock_llm import ask as llm_ask
+# Remove existing handlers to avoid duplicate logs if basicConfig was called elsewhere
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
 
-# ─────────────────────────────────────────────────────────
-# Logging — JSON structured
-# ─────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.DEBUG if settings.debug else logging.INFO,
-    format='{"ts":"%(asctime)s","lvl":"%(levelname)s","msg":"%(message)s"}',
-)
+handler = logging.StreamHandler()
+handler.setFormatter(JsonFormatter())
 logger = logging.getLogger(__name__)
+_logger_level = settings.LOG_LEVEL.upper() if hasattr(settings, 'LOG_LEVEL') else "INFO"
+logger.setLevel(_logger_level)
+logger.addHandler(handler)
 
-START_TIME = time.time()
+# Initialize Redis client for conversation history and other stateful operations
+redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+
+START_TIME = time.time() # For uptime calculation
 _is_ready = False
-_request_count = 0
-_error_count = 0
+_in_flight_requests = 0  # đếm số request đang xử lý
 
-# ─────────────────────────────────────────────────────────
-# Simple In-memory Rate Limiter
-# ─────────────────────────────────────────────────────────
-_rate_windows: dict[str, deque] = defaultdict(deque)
 
-def check_rate_limit(key: str):
-    now = time.time()
-    window = _rate_windows[key]
-    while window and window[0] < now - 60:
-        window.popleft()
-    if len(window) >= settings.rate_limit_per_minute:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {settings.rate_limit_per_minute} req/min",
-            headers={"Retry-After": "60"},
-        )
-    window.append(now)
-
-# ─────────────────────────────────────────────────────────
-# Simple Cost Guard
-# ─────────────────────────────────────────────────────────
-_daily_cost = 0.0
-_cost_reset_day = time.strftime("%Y-%m-%d")
-
-def check_and_record_cost(input_tokens: int, output_tokens: int):
-    global _daily_cost, _cost_reset_day
-    today = time.strftime("%Y-%m-%d")
-    if today != _cost_reset_day:
-        _daily_cost = 0.0
-        _cost_reset_day = today
-    if _daily_cost >= settings.daily_budget_usd:
-        raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
-    cost = (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
-    _daily_cost += cost
-
-# ─────────────────────────────────────────────────────────
-# Auth
-# ─────────────────────────────────────────────────────────
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-def verify_api_key(api_key: str = Security(api_key_header)) -> str:
-    if not api_key or api_key != settings.agent_api_key:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing API key. Include header: X-API-Key: <key>",
-        )
-    return api_key
-
-# ─────────────────────────────────────────────────────────
-# Lifespan
-# ─────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _is_ready
-    logger.info(json.dumps({
-        "event": "startup",
-        "app": settings.app_name,
-        "version": settings.app_version,
-        "environment": settings.environment,
-    }))
-    time.sleep(0.1)  # simulate init
+    # ── Startup ──
+    logger.info("Agent starting up...")
+    logger.info("Loading model and checking dependencies...")
+    try:
+        redis_client.ping()
+        logger.info("Redis connection successful.", extra={"event": "redis_connection_success"})
+    except redis.exceptions.ConnectionError as e:
+        logger.error(f"Redis connection failed: {e}", extra={"event": "redis_connection_error"})
+        # Depending on criticality, you might want to exit here or mark as not ready
+        # For now, we'll let readiness probe handle it.
+
+    time.sleep(0.2)  # Simulate startup time
     _is_ready = True
-    logger.info(json.dumps({"event": "ready"}))
+    logger.info("✅ Agent is ready!", extra={"event": "agent_ready"})
 
     yield
-
+    # ── Shutdown ──
     _is_ready = False
-    logger.info(json.dumps({"event": "shutdown"}))
+    logger.info("🔄 Graceful shutdown initiated...", extra={"event": "shutdown_initiated"})
 
-# ─────────────────────────────────────────────────────────
-# App
-# ─────────────────────────────────────────────────────────
-app = FastAPI(
-    title=settings.app_name,
-    version=settings.app_version,
-    lifespan=lifespan,
-    docs_url="/docs" if settings.environment != "production" else None,
-    redoc_url=None,
-)
+    # Chờ request đang xử lý hoàn thành (tối đa 30 giây)
+    timeout = 30
+    elapsed = 0
+    while _in_flight_requests > 0 and elapsed < timeout:
+        logger.info(f"Waiting for {_in_flight_requests} in-flight requests...", extra={"event": "waiting_for_requests", "in_flight": _in_flight_requests})
+        time.sleep(1)
+        elapsed += 1
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.allowed_origins,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
-)
+    redis_client.close() # Close Redis connection
+    logger.info("✅ Shutdown complete", extra={"event": "shutdown_complete"})
+
+
+app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=lifespan)
+
 
 @app.middleware("http")
-async def request_middleware(request: Request, call_next):
-    global _request_count, _error_count
-    start = time.time()
-    _request_count += 1
+async def track_requests(request, call_next):
+    """Theo dõi số request đang xử lý."""
+    global _in_flight_requests
+    _in_flight_requests += 1
     try:
-        response: Response = await call_next(request)
-        # Security headers
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers.pop("server", None)
-        duration = round((time.time() - start) * 1000, 1)
-        logger.info(json.dumps({
-            "event": "request",
-            "method": request.method,
-            "path": request.url.path,
-            "status": response.status_code,
-            "ms": duration,
-        }))
+        response = await call_next(request)
         return response
-    except Exception as e:
-        _error_count += 1
-        raise
+    finally:
+        _in_flight_requests -= 1
 
-# ─────────────────────────────────────────────────────────
-# Models
-# ─────────────────────────────────────────────────────────
-class AskRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=2000,
-                          description="Your question for the agent")
 
-class AskResponse(BaseModel):
-    question: str
-    answer: str
-    model: str
-    timestamp: str
+# ──────────────────────────────────────────────────────────
+# Business Logic
+# ──────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────
-# Endpoints
-# ─────────────────────────────────────────────────────────
-
-@app.get("/", tags=["Info"])
+@app.get("/") # Root endpoint for basic info
 def root():
     return {
-        "app": settings.app_name,
-        "version": settings.app_version,
-        "environment": settings.environment,
-        "endpoints": {
-            "ask": "POST /ask (requires X-API-Key)",
-            "health": "GET /health",
-            "ready": "GET /ready",
-        },
+        "app": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        "environment": settings.ENVIRONMENT,
+        "status": "running",
     }
 
 
-@app.post("/ask", response_model=AskResponse, tags=["Agent"])
+class AskRequest(BaseModel):
+    question: str
+
+@app.post("/ask")
 async def ask_agent(
-    body: AskRequest,
-    request: Request,
-    _key: str = Depends(verify_api_key),
+    request: AskRequest,
+    user_id: str = Depends(verify_api_key), # user_id is the API key for simplicity
+    _rate_limit: None = Depends(check_rate_limit),
+    _budget: None = Depends(check_budget)
 ):
-    """
-    Send a question to the AI agent.
-
-    **Authentication:** Include header `X-API-Key: <your-key>`
-    """
-    # Rate limit per API key
-    check_rate_limit(_key[:8])  # use first 8 chars as key bucket
-
-    # Budget check
-    input_tokens = len(body.question.split()) * 2
-    check_and_record_cost(input_tokens, 0)
-
-    logger.info(json.dumps({
-        "event": "agent_call",
-        "q_len": len(body.question),
-        "client": str(request.client.host) if request.client else "unknown",
-    }))
-
-    answer = llm_ask(body.question)
-
-    output_tokens = len(answer.split()) * 2
-    check_and_record_cost(0, output_tokens)
-
-    return AskResponse(
-        question=body.question,
-        answer=answer,
-        model=settings.llm_model,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-    )
-
-
-@app.get("/health", tags=["Operations"])
-def health():
-    """Liveness probe. Platform restarts container if this fails."""
-    status = "ok"
-    checks = {"llm": "mock" if not settings.openai_api_key else "openai"}
-    return {
-        "status": status,
-        "version": settings.app_version,
-        "environment": settings.environment,
-        "uptime_seconds": round(time.time() - START_TIME, 1),
-        "total_requests": _request_count,
-        "checks": checks,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-@app.get("/ready", tags=["Operations"])
-def ready():
-    """Readiness probe. Load balancer stops routing here if not ready."""
     if not _is_ready:
-        raise HTTPException(503, "Not ready")
-    return {"ready": True}
+        raise HTTPException(503, "Agent not ready")
+
+    # Retrieve conversation history from Redis
+    history_key = f"conversation:{user_id}"
+    conversation_history = redis_client.lrange(history_key, 0, -1)
+    conversation_history = [json.loads(item) for item in conversation_history]
+
+    # Add current question to history (for LLM context)
+    current_conversation = conversation_history + [{"role": "user", "content": request.question}]
+
+    # Simulate LLM call with mock_llm
+    llm_response = ask(request.question) # Assuming mock_llm can take just question
+
+    # Add LLM response to history
+    current_conversation.append({"role": "assistant", "content": llm_response})
+
+    # Store updated conversation history in Redis (trimming if necessary)
+    redis_client.rpush(history_key, json.dumps({"role": "user", "content": request.question}))
+    redis_client.rpush(history_key, json.dumps({"role": "assistant", "content": llm_response}))
+    redis_client.ltrim(history_key, -settings.CONVERSATION_HISTORY_LENGTH, -1) # Keep last N entries
+    redis_client.expire(history_key, settings.CONVERSATION_HISTORY_TTL_SECONDS) # Expire after some time
+
+    return {"answer": llm_response, "conversation_history": current_conversation}
 
 
-@app.get("/metrics", tags=["Operations"])
-def metrics(_key: str = Depends(verify_api_key)):
-    """Basic metrics (protected)."""
+# ──────────────────────────────────────────────────────────
+# HEALTH CHECKS — Phần quan trọng nhất của file này
+# ──────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    """
+    LIVENESS PROBE — "Agent có còn sống không?"
+
+    Cloud platform (Railway, Render, K8s) gọi endpoint này định kỳ.
+    Nếu trả về non-200 hoặc timeout → platform restart container.
+
+    Nên trả về:
+    - status: "ok" hoặc "degraded"
+    - uptime: seconds
+    - version: để biết đang chạy version nào
+    """
+    uptime = round(time.time() - START_TIME, 1)
+
+    # Kiểm tra dependencies quan trọng
+    checks = {}
+
+    # Check memory (ví dụ đơn giản)
+    try: # psutil is imported at the top
+        mem = psutil.virtual_memory()
+        checks["memory"] = {
+            "status": "ok" if mem.percent < 90 else "degraded",
+            "used_percent": mem.percent,
+        }
+    except ImportError:
+        checks["memory"] = {"status": "ok", "note": "psutil not installed"}
+    except Exception as e:
+        checks["memory"] = {"status": "degraded", "error": str(e)}
+
+    overall_status = "ok" if all(
+        v.get("status") == "ok" for v in checks.values()
+    ) else "degraded"
+
     return {
-        "uptime_seconds": round(time.time() - START_TIME, 1),
-        "total_requests": _request_count,
-        "error_count": _error_count,
-        "daily_cost_usd": round(_daily_cost, 4),
-        "daily_budget_usd": settings.daily_budget_usd,
-        "budget_used_pct": round(_daily_cost / settings.daily_budget_usd * 100, 1),
+        "status": overall_status,
+        "uptime_seconds": uptime,
+        "version": settings.APP_VERSION,
+        "environment": settings.ENVIRONMENT,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "checks": checks,
     }
 
 
-# ─────────────────────────────────────────────────────────
-# Graceful Shutdown
-# ─────────────────────────────────────────────────────────
-def _handle_signal(signum, _frame):
-    logger.info(json.dumps({"event": "signal", "signum": signum}))
+@app.get("/ready")
+def ready():
+    """
+    READINESS PROBE — "Agent có sẵn sàng nhận request chưa?"
 
-signal.signal(signal.SIGTERM, _handle_signal)
+    Load balancer dùng endpoint này để quyết định có route
+    traffic vào instance này không.
+
+    Trả về 503 khi:
+    - Đang khởi động (model chưa load xong)
+    - Đang shutdown
+    - Database/dependencies chưa connect
+    """
+    if not _is_ready:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent not ready. Check back in a few seconds.",
+        )
+    # Check Redis connection
+    try:
+        redis_client.ping()
+    except redis.exceptions.ConnectionError as e:
+        logger.error(f"Readiness check failed: Redis not connected: {e}", extra={"event": "readiness_redis_fail"})
+        raise HTTPException(status_code=503, detail=f"Dependency not ready: Redis connection failed: {e}")
+    return {
+        "ready": True,
+        "in_flight_requests": _in_flight_requests,
+    }
+
+
+# ──────────────────────────────────────────────────────────
+# GRACEFUL SHUTDOWN
+# ──────────────────────────────────────────────────────────
+
+def handle_sigterm(signum, frame):
+    """
+    SIGTERM là signal platform gửi khi muốn dừng container.
+    Khác với SIGKILL (không thể catch được).
+
+    uvicorn bắt SIGTERM tự động và gọi lifespan shutdown.
+    Hàm này để log thêm thông tin.
+    """
+    logger.info(f"Received signal {signum} — uvicorn will handle graceful shutdown", extra={"event": "sigterm_received", "signal": signum})
+
+
+signal.signal(signal.SIGTERM, handle_sigterm)
+signal.signal(signal.SIGINT, handle_sigterm) # Also handle Ctrl+C for local development
 
 
 if __name__ == "__main__":
-    logger.info(f"Starting {settings.app_name} on {settings.host}:{settings.port}")
-    logger.info(f"API Key: {settings.agent_api_key[:4]}****")
+    logger.info(f"Starting {settings.APP_NAME} on port {settings.PORT}", extra={"event": "uvicorn_start"})
     uvicorn.run(
-        "app.main:app",
-        host=settings.host,
-        port=settings.port,
-        reload=settings.debug,
+        app,
+        host=settings.HOST,
+        port=settings.PORT,
+        reload=settings.DEBUG, # Only reload in debug mode
+        # ✅ Cho phép graceful shutdown
         timeout_graceful_shutdown=30,
+        log_config=None # Disable uvicorn's default logging to use our custom logger
     )

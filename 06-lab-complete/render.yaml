@@ -1,23 +1,56 @@
+# ============================================================
+# render.yaml — Infrastructure as Code cho Render
+#
+# Docs: https://render.com/docs/blueprint-spec
+# Commit file này vào git → Render tự sync infrastructure.
+# ============================================================
+
 services:
+  # ──────────────────────────────────────
+  # Web Service — AI Agent
+  # ──────────────────────────────────────
   - type: web
-    name: ai-agent-production
-    runtime: docker
-    region: singapore
-    plan: starter
-    healthCheckPath: /health
-    autoDeploy: true
+    name: ai-agent
+    runtime: python
+    region: oregon # Chọn region gần user nhất
+    plan: starter # free | starter | standard | pro
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: sh -c 'uvicorn app.main:app --host 0.0.0.0 --port $PORT'
+
+    healthCheckPath: /health   # Render check path này
+
+    autoDeploy: true           # Auto deploy khi push to GitHub
+
     envVars:
       - key: ENVIRONMENT
         value: production
-      - key: APP_VERSION
-        value: "1.0.0"
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      # Secrets — set qua Render Dashboard (không commit giá trị thật)
       - key: OPENAI_API_KEY
-        sync: false
+        sync: false            # sync: false = set thủ công trên dashboard
       - key: AGENT_API_KEY
-        generateValue: true
-      - key: JWT_SECRET
-        generateValue: true
-      - key: DAILY_BUDGET_USD
-        value: "5.0"
+        generateValue: true    # Render tự sinh random value
+      - key: REDIS_URL
+        fromService:
+          name: agent-cache # Name of the Redis service below
+          type: redis
+          property: connectionString
       - key: RATE_LIMIT_PER_MINUTE
-        value: "20"
+        value: "10"
+      - key: MONTHLY_BUDGET_USD
+        value: "10.0"
+      - key: CONVERSATION_HISTORY_LENGTH
+        value: "10"
+      - key: CONVERSATION_HISTORY_TTL_SECONDS
+        value: "3600"
+      - key: LOG_LEVEL
+        value: "INFO"
+
+  # ──────────────────────────────────────
+  # Redis (dùng Render Redis add-on)
+  # ──────────────────────────────────────
+  - type: redis
+    name: agent-cache
+    plan: free

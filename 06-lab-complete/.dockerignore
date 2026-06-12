@@ -1,11 +1,19 @@
-__pycache__/
+__pycache__
 *.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.git
+.gitignore
+.dockerignore
 .env
 .env.*
 !.env.example
-venv/
-.venv/
-.git/
-*.md
-tests/
+*.log
 .DS_Store
+
+# Ignore the mock_llm if it's part of a larger utils folder outside this context
+# but for this lab, we've placed it inside app/

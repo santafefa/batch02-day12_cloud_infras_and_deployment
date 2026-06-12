@@ -1,49 +1,36 @@
-# ============================================================
-# Production Dockerfile — Multi-stage, < 500 MB, non-root
-# ============================================================
-
-# Stage 1: Builder
+# Stage 1: Builder - Install dependencies
 FROM python:3.11-slim AS builder
-
-WORKDIR /build
-
-RUN apt-get update && apt-get install -y gcc libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
-
-
-# Stage 2: Runtime
-FROM python:3.11-slim AS runtime
-
-# Non-root user
-RUN groupadd -r agent && useradd -r -g agent -d /app agent
 
 WORKDIR /app
 
-# Copy packages từ builder
-COPY --from=builder /root/.local /home/agent/.local
+# Copy requirements.txt and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
 
-# Copy application
-COPY app/ ./app/
-COPY utils/ ./utils/
+# Stage 2: Runtime - Copy only necessary files for running the application
+FROM python:3.11-slim
 
-RUN chown -R agent:agent /app
+WORKDIR /app
+# Create a non-root user for security best practices
+RUN useradd -m appuser
+USER appuser
 
-USER agent
+# Copy Python packages installed by pip --user from builder stage
+# When pip install --user is run as root, packages go to /root/.local
+COPY --from=builder /root/.local /home/appuser/.local
 
-ENV PATH=/home/agent/.local/bin:$PATH
-ENV PYTHONPATH=/app
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+# Copy the entire project directory into the container's WORKDIR
+COPY . .
 
+# Set environment variable for Python to find user-installed packages
+ENV PATH="/home/appuser/.local/bin:$PATH" 
+# Add /app (the project root) to Python path
+ENV PYTHONPATH="/app"
+# Expose the port the application runs on
 EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD python -c \
-    "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" \
-    || exit 1
+# Healthcheck to ensure container is healthy
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# Command to run the application
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
