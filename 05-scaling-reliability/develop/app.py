@@ -25,6 +25,7 @@ import logging
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
+import psutil # Import psutil for memory check
 
 from fastapi import FastAPI, HTTPException
 import uvicorn
@@ -162,6 +163,11 @@ def ready():
             status_code=503,
             detail="Agent not ready. Check back in a few seconds.",
         )
+    # TODO: Thêm các kiểm tra dependency khác ở đây, ví dụ Redis, Database
+    # try:
+    #     r.ping() # Giả định có kết nối Redis
+    # except Exception as e:
+    #     raise HTTPException(status_code=503, detail=f"Dependency not ready: {e}")
     return {
         "ready": True,
         "in_flight_requests": _in_flight_requests,
